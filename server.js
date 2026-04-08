@@ -62,7 +62,7 @@ async function sendTelegram(token, chatId, text) {
   }
 }
 
-async function createQrisFromPakasir(orderId, amount, userId) {
+async function createQrisFromPakasir(orderId, amount) {
   if (!PAKASIR_API_KEY) throw new Error('PAKASIR_API_KEY belum diset di env Railway.');
   if (!PAKASIR_PROJECT) throw new Error('PAKASIR_PROJECT belum diset di env Railway.');
 
@@ -73,12 +73,12 @@ async function createQrisFromPakasir(orderId, amount, userId) {
       project:  PAKASIR_PROJECT,
       order_id: orderId,
       amount:   amount,
-      user_id:  String(userId),
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
   );
 
-  const data = res.data?.payment ?? res.data?.data ?? res.data ?? {};
+  // Docs Pakasir: response ada di res.data.payment (bukan .data)
+  const data          = res.data?.payment ?? res.data?.data ?? res.data ?? {};
   const paymentNumber = data.payment_number ?? data.qris_number ?? data.qr_string ?? null;
   const expiredAt     = data.expired_at ?? data.expiry ?? null;
 
@@ -125,14 +125,14 @@ app.get('/health', (_, res) => res.json({ status: 'ok' }));
  */
 app.post('/transaction', requireInternal, async (req, res) => {
   const { order_id, user_id, bot_prefix } = req.body ?? {};
-const amount = Number(req.body?.amount);
+  const amount = Number(req.body?.amount);
 
-if (!order_id || !user_id || isNaN(amount) || amount <= 0) {
+  if (!order_id || !user_id || isNaN(amount) || amount <= 0) {
     return res.status(400).json({ error: 'order_id, user_id, dan amount (>0) wajib diisi.' });
   }
 
   try {
-    const qris = await createQrisFromPakasir(order_id, amount, user_id);
+    const qris = await createQrisFromPakasir(order_id, amount);
 
     const expiredAt = qris.expiredAt ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
@@ -229,4 +229,4 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
 process.on('uncaughtException',  (e) => console.error(`[uncaughtException] ${e.message}`, e.stack));
 process.on('unhandledRejection', (e) => console.error(`[unhandledRejection] ${e}`));
-       
+           
