@@ -78,7 +78,7 @@ async function createQrisFromPakasir(orderId, amount, userId) {
     { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
   );
 
-  const data          = res.data?.data ?? res.data ?? {};
+  const data = res.data?.payment ?? res.data?.data ?? res.data ?? {};
   const paymentNumber = data.payment_number ?? data.qris_number ?? data.qr_string ?? null;
   const expiredAt     = data.expired_at ?? data.expiry ?? null;
 
