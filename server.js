@@ -1,120 +1,52 @@
 'use strict';
 
 /**
- * PAKASIR RAILWAY WEBHOOK SERVER — Production Edition
- * ─────────────────────────────────────────────────────
- * Tugas:
- *   1. Terima POST /transaction dari bot → simpan ke DB, panggil Pakasir API → buat QRIS
- *   2. Terima POST /webhook/pakasir (dari Pakasir) → credit saldo Railway DB → notif bot
- *   3. Endpoint utilitas: GET /transaction/:id, GET /balance/:telegram_id
+ * PAKASIR RAILWAY WEBHOOK SERVER — Stateless Edition (v3)
+ * ─────────────────────────────────────────────────────────
+ * Tidak pakai SQLite — cocok untuk Railway Trial (no Volume).
  *
- * Keamanan:
- *   - WEBHOOK_SECRET: Pakasir mengirim header X-Pakasir-Signature atau query ?secret=
- *   - INTERNAL_SECRET: Bot harus kirim header X-Internal-Key agar endpoint internal tidak publik
- *   - Idempotent webhook: double-credit mustahil karena SELECT+UPDATE dalam satu DB transaction
- *   - WAL mode + busy_timeout agar aman concurrent write
- *   - Graceful shutdown: tutup DB + HTTP server dengan bersih
+ * Tugas:
+ *   1. POST /transaction  → proxy ke Pakasir API → buat QRIS → balik ke bot
+ *   2. POST /webhook/pakasir → terima notif dari Pakasir → forward ke bot via Telegram
+ *   3. GET  /health       → health check
+ *
+ * State (balance, idempotency) dikelola sepenuhnya di DB bot (Pterodactyl).
+ *
+ * Env vars yang dibutuhkan:
+ *   PORT                 (auto-set oleh Railway)
+ *   PAKASIR_API_KEY      API key dari app.pakasir.com
+ *   PAKASIR_PROJECT      Project ID di Pakasir
+ *   PAKASIR_SLUG         Slug halaman pay (default: kirimkode)
+ *   BOT_TOKEN_A          Token bot Telegram
+ *   INTERNAL_SECRET      Secret untuk autentikasi request dari bot
+ *   WEBHOOK_SECRET       Secret dari Pakasir (opsional tapi dianjurkan)
  */
 
-const express  = require('express');
-const axios    = require('axios');
-const Database = require('better-sqlite3');
-const path     = require('path');
-const fs       = require('fs');
-const crypto   = require('crypto');
+const express = require('express');
+const axios   = require('axios');
 
-// ─── CONFIG ────────────────────────────────────────────────────────────────
-const PORT              = parseInt(process.env.PORT) || 3000;
-const PAKASIR_API_KEY   = process.env.PAKASIR_API_KEY   || '';
-const PAKASIR_PROJECT   = process.env.PAKASIR_PROJECT   || '';
-const PAKASIR_SLUG      = process.env.PAKASIR_SLUG      || 'kirimkode';   // slug halaman pay
-const BOT_TOKENS        = {
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
+const PORT            = parseInt(process.env.PORT) || 3000;
+const PAKASIR_API_KEY = process.env.PAKASIR_API_KEY   || '';
+const PAKASIR_PROJECT = process.env.PAKASIR_PROJECT   || '';
+const PAKASIR_SLUG    = process.env.PAKASIR_SLUG      || 'kirimkode';
+const BOT_TOKENS      = {
   BOTA: process.env.BOT_TOKEN_A || '',
   BOTB: process.env.BOT_TOKEN_B || '',
 };
-const INTERNAL_SECRET   = process.env.INTERNAL_SECRET   || '';   // bot wajib kirim ini
-const WEBHOOK_SECRET    = process.env.WEBHOOK_SECRET    || '';   // Pakasir webhook secret (opsional)
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET   || '';
+const WEBHOOK_SECRET  = process.env.WEBHOOK_SECRET    || '';
 
 const PAKASIR_CREATE_URL = 'https://app.pakasir.com/api/transactioncreate/qris';
 
-// ─── DATABASE ───────────────────────────────────────────────────────────────
-const DB_PATH = path.resolve(process.env.DB_PATH || './data/pakasir.db');
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.pragma('synchronous   = NORMAL');
-db.pragma('foreign_keys  = ON');
-db.pragma('busy_timeout  = 10000');
-db.pragma('cache_size    = -16000');  // 16 MB page cache
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS transactions (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id       TEXT    UNIQUE NOT NULL,
-    user_id        TEXT    NOT NULL,
-    amount         REAL    NOT NULL,
-    status         TEXT    DEFAULT 'pending',
-    bot_prefix     TEXT,
-    payment_number TEXT,
-    pay_url        TEXT,
-    expired_at     TEXT,
-    credited_at    TEXT,
-    created_at     TEXT    DEFAULT (datetime('now')),
-    updated_at     TEXT    DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id TEXT    UNIQUE NOT NULL,
-    balance     REAL    DEFAULT 0,
-    updated_at  TEXT    DEFAULT (datetime('now'))
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_tx_user   ON transactions(user_id);
-  CREATE INDEX IF NOT EXISTS idx_tx_status ON transactions(status);
-`);
-
-// ─── STATEMENTS (prepared once, reused) ────────────────────────────────────
-const stmts = {
-  insertTx: db.prepare(`
-    INSERT OR IGNORE INTO transactions
-      (order_id, user_id, amount, bot_prefix, payment_number, pay_url, expired_at)
-    VALUES (@order_id, @user_id, @amount, @bot_prefix, @payment_number, @pay_url, @expired_at)
-  `),
-  getTx:      db.prepare(`SELECT * FROM transactions WHERE order_id=?`),
-  markSuccess: db.prepare(`
-    UPDATE transactions
-    SET status='success', credited_at=datetime('now'), updated_at=datetime('now')
-    WHERE order_id=? AND status='pending'
-  `),
-  markExpired: db.prepare(`
-    UPDATE transactions SET status='expired', updated_at=datetime('now') WHERE order_id=?
-  `),
-  upsertBalance: db.prepare(`
-    INSERT INTO users (telegram_id, balance) VALUES (?, ?)
-    ON CONFLICT(telegram_id) DO UPDATE SET
-      balance    = balance + excluded.balance,
-      updated_at = datetime('now')
-  `),
-  getBalance: db.prepare(`SELECT balance FROM users WHERE telegram_id=?`),
-};
-
-// Credit saldo dalam satu atomic DB transaction (idempotent)
-const creditBalance = db.transaction((order_id, user_id, amount) => {
-  const changed = stmts.markSuccess.run(order_id).changes;
-  if (changed === 0) return false;   // sudah diproses sebelumnya → skip
-  stmts.upsertBalance.run(user_id, amount);
-  return true;
-});
-
-// ─── HELPERS ────────────────────────────────────────────────────────────────
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 function getBotToken(orderId) {
   if (!orderId) return null;
   for (const [prefix, token] of Object.entries(BOT_TOKENS)) {
     if (orderId.startsWith(prefix) && token) return token;
   }
-  return null;
+  // Fallback ke token pertama yang ada
+  return Object.values(BOT_TOKENS).find(t => t) || null;
 }
 
 async function sendTelegram(token, chatId, text) {
@@ -146,9 +78,7 @@ async function createQrisFromPakasir(orderId, amount, userId) {
     { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
   );
 
-  const data = res.data?.data ?? res.data ?? {};
-
-  // Ambil payment_number (string QRIS) dari beberapa kemungkinan field
+  const data          = res.data?.data ?? res.data ?? {};
   const paymentNumber = data.payment_number ?? data.qris_number ?? data.qr_string ?? null;
   const expiredAt     = data.expired_at ?? data.expiry ?? null;
 
@@ -156,20 +86,18 @@ async function createQrisFromPakasir(orderId, amount, userId) {
     throw new Error(`Pakasir tidak mengembalikan QRIS. Response: ${JSON.stringify(res.data)}`);
   }
 
-  // URL pembayaran dengan qris_only=1 agar user langsung lihat QR
   const payUrl = `https://app.pakasir.com/pay/${PAKASIR_SLUG}/${orderId}?qris_only=1`;
 
   return { paymentNumber, payUrl, expiredAt };
 }
 
-// ─── MIDDLEWARE ──────────────────────────────────────────────────────────────
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '256kb' }));
 app.disable('x-powered-by');
 
-// Validasi internal key (untuk endpoint yang dipanggil bot)
 function requireInternal(req, res, next) {
-  if (!INTERNAL_SECRET) return next();  // dev mode: tanpa secret
+  if (!INTERNAL_SECRET) return next(); // dev mode
   const key = req.headers['x-internal-key'] || req.query.key;
   if (key !== INTERNAL_SECRET) return res.status(401).json({ error: 'Unauthorized.' });
   next();
@@ -178,152 +106,112 @@ function requireInternal(req, res, next) {
 // ─── ROUTES ──────────────────────────────────────────────────────────────────
 
 // Health check
-app.get('/', (_, res) => res.json({ status: 'ok', service: 'pakasir-railway', ts: new Date().toISOString() }));
+app.get('/', (_, res) => res.json({
+  status:  'ok',
+  service: 'pakasir-railway',
+  version: '3.0.0',
+  ts:      new Date().toISOString(),
+}));
+
+app.get('/health', (_, res) => res.json({ status: 'ok' }));
 
 /**
  * POST /transaction
- * Dipanggil bot setiap kali user minta deposit.
- * 1. Simpan ke DB Railway (INSERT OR IGNORE — idempotent)
- * 2. Panggil Pakasir API untuk buat QRIS
- * 3. Kembalikan { payment_number, pay_url, expired_at } ke bot
+ * Dipanggil bot → Railway proxy ke Pakasir API → balik QRIS ke bot.
+ * Bot yang menyimpan transaksi ke DB-nya sendiri (Pterodactyl).
  *
- * Body: { order_id, user_id, amount, bot_prefix, expired_at? }
+ * Body: { order_id, user_id, amount, bot_prefix }
+ * Response: { ok, order_id, payment_number, pay_url, expired_at }
  */
 app.post('/transaction', requireInternal, async (req, res) => {
-  const { order_id, user_id, amount, bot_prefix, expired_at } = req.body ?? {};
+  const { order_id, user_id, amount, bot_prefix } = req.body ?? {};
 
   if (!order_id || !user_id || typeof amount !== 'number' || amount <= 0) {
     return res.status(400).json({ error: 'order_id, user_id, dan amount (>0) wajib diisi.' });
   }
 
   try {
-    // Cek apakah order_id ini sudah ada (retry idempotency)
-    let tx = stmts.getTx.get(order_id);
+    const qris = await createQrisFromPakasir(order_id, amount, user_id);
 
-    if (!tx) {
-      // Panggil Pakasir untuk buat QRIS
-      let qris;
-      try {
-        qris = await createQrisFromPakasir(order_id, amount, user_id);
-      } catch (e) {
-        console.error(`[createQris] ${e.message}`);
-        return res.status(502).json({ error: `Gagal buat QRIS dari Pakasir: ${e.message}` });
-      }
+    const expiredAt = qris.expiredAt ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-      const expAt = qris.expiredAt ?? expired_at ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
-      stmts.insertTx.run({
-        order_id,
-        user_id:        String(user_id),
-        amount,
-        bot_prefix:     bot_prefix ?? null,
-        payment_number: qris.paymentNumber,
-        pay_url:        qris.payUrl,
-        expired_at:     expAt,
-      });
-
-      tx = stmts.getTx.get(order_id);
-    }
+    console.log(`[/transaction] OK: order=${order_id} user=${user_id} amount=${amount}`);
 
     return res.json({
       ok:             true,
-      order_id:       tx.order_id,
-      payment_number: tx.payment_number,
-      pay_url:        tx.pay_url,
-      expired_at:     tx.expired_at,
-      status:         tx.status,
+      order_id,
+      payment_number: qris.paymentNumber,
+      pay_url:        qris.payUrl,
+      expired_at:     expiredAt,
     });
   } catch (e) {
-    console.error(`[POST /transaction] ${e.message}`);
-    return res.status(500).json({ error: e.message });
+    console.error(`[/transaction] ERROR: ${e.message}`);
+    return res.status(502).json({ error: `Gagal buat QRIS: ${e.message}` });
   }
 });
 
 /**
  * POST /webhook/pakasir
- * Diterima dari Pakasir setelah user selesai bayar.
- * Pakasir kirim: { order_id, status, amount, ... }
- * Kita harus balas 200 secepat mungkin, baru proses async.
+ * Diterima dari Pakasir setelah user bayar.
+ * Railway tidak punya DB — kita hanya forward notif ke bot via Telegram.
+ * Bot yang update saldo di DB-nya.
+ *
+ * Pakasir kirim: { order_id, status, amount, user_id, ... }
  */
 app.post('/webhook/pakasir', (req, res) => {
-  // Balas Pakasir dulu — maksimum 3 detik
+  // Balas Pakasir dulu — harus cepat
   res.status(200).json({ received: 'ok' });
 
-  // Validasi webhook secret (opsional tapi dianjurkan)
+  // Validasi signature (opsional)
   if (WEBHOOK_SECRET) {
     const sig = req.headers['x-pakasir-signature'] ?? req.query.secret ?? '';
     if (sig !== WEBHOOK_SECRET) {
-      console.warn(`[Webhook] Invalid signature: ${sig}`);
+      console.warn(`[Webhook] Signature tidak valid: ${sig}`);
       return;
     }
   }
 
   setImmediate(async () => {
     try {
-      const { order_id, status, amount } = req.body ?? {};
+      const { order_id, status, amount, user_id } = req.body ?? {};
+
       if (!order_id) return;
 
-      // Hanya proses jika status completed/paid
-      if (!['completed', 'paid', 'settlement', 'success'].includes(String(status).toLowerCase())) return;
+      console.log(`[Webhook] order=${order_id} status=${status} amount=${amount}`);
 
-      const tx = stmts.getTx.get(order_id);
-      if (!tx) { console.warn(`[Webhook] order_id ${order_id} tidak ditemukan.`); return; }
+      const isPaid = ['completed', 'paid', 'settlement', 'success']
+        .includes(String(status).toLowerCase());
 
-      // Cek expired
-      if (tx.expired_at) {
-        const exp = new Date(tx.expired_at);
-        if (!isNaN(exp.getTime()) && new Date() > exp) {
-          stmts.markExpired.run(order_id);
-          console.warn(`[Webhook] ${order_id} expired.`);
-          return;
-        }
-      }
+      if (!isPaid) return;
 
-      // Credit saldo (atomic + idempotent)
-      const credited = creditBalance(order_id, tx.user_id, tx.amount);
-      if (!credited) {
-        console.info(`[Webhook] ${order_id} sudah diproses sebelumnya, skip.`);
+      // Forward ke bot via Telegram — bot yang handle credit saldo
+      // Format pesan khusus agar bot bisa parse
+      const token = getBotToken(order_id);
+      if (!token) {
+        console.warn(`[Webhook] Tidak ada token untuk order ${order_id}`);
         return;
       }
 
-      console.info(`[Webhook] Deposit OK: order=${order_id} user=${tx.user_id} amount=${tx.amount}`);
-
-      // Notif ke user via Telegram
-      const token = getBotToken(order_id);
-      if (token) {
+      // Kirim ke user (jika user_id tersedia dari Pakasir)
+      const chatId = user_id || null;
+      if (chatId) {
         const text =
           `✅ *Deposit Berhasil!*\n\n` +
-          `💵 Jumlah : *Rp ${Number(tx.amount).toLocaleString('id-ID')}*\n` +
-          `🆔 Order  : \`${order_id.slice(0, 12)}...\`\n\n` +
+          `💵 Jumlah : *Rp ${Number(amount).toLocaleString('id-ID')}*\n` +
+          `🆔 Order  : \`${order_id.slice(0, 16)}...\`\n\n` +
           `Saldo sudah masuk ke akun Anda.\n_Silakan order OTP sekarang!_`;
-        await sendTelegram(token, tx.user_id, text);
+
+        await sendTelegram(token, chatId, text);
       }
+
+      console.log(`[Webhook] Notif dikirim: order=${order_id} chatId=${chatId}`);
     } catch (e) {
       console.error(`[Webhook async] ${e.message}`);
     }
   });
 });
 
-/**
- * GET /transaction/:order_id
- * Bot polling untuk cek apakah sudah dibayar.
- */
-app.get('/transaction/:order_id', requireInternal, (req, res) => {
-  const tx = stmts.getTx.get(req.params.order_id);
-  if (!tx) return res.status(404).json({ error: 'Tidak ditemukan.' });
-  return res.json({ ok: true, transaction: tx });
-});
-
-/**
- * GET /balance/:telegram_id
- * Saldo user di Railway DB (bukan saldo bot lokal).
- */
-app.get('/balance/:telegram_id', requireInternal, (req, res) => {
-  const row = stmts.getBalance.get(req.params.telegram_id);
-  return res.json({ telegram_id: req.params.telegram_id, balance: row?.balance ?? 0 });
-});
-
-// ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
+// ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────────
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Pakasir Railway server berjalan di port ${PORT}`);
 });
@@ -331,11 +219,10 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 function shutdown(signal) {
   console.log(`[${signal}] Menutup server...`);
   server.close(() => {
-    db.close();
-    console.log('DB ditutup. Exit.');
+    console.log('Server ditutup. Exit.');
     process.exit(0);
   });
-  setTimeout(() => process.exit(1), 10000);
+  setTimeout(() => process.exit(1), 5000);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
