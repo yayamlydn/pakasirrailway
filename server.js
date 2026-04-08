@@ -62,7 +62,7 @@ async function sendTelegram(token, chatId, text) {
   }
 }
 
-async function createQrisFromPakasir(orderId, amount, userId) {
+async function createQrisFromPakasir(orderId, amount) {
   if (!PAKASIR_API_KEY) throw new Error('PAKASIR_API_KEY belum diset di env Railway.');
   if (!PAKASIR_PROJECT) throw new Error('PAKASIR_PROJECT belum diset di env Railway.');
 
@@ -73,12 +73,12 @@ async function createQrisFromPakasir(orderId, amount, userId) {
       project:  PAKASIR_PROJECT,
       order_id: orderId,
       amount:   amount,
-      user_id:  String(userId),
     },
     { headers: { 'Content-Type': 'application/json' }, timeout: 20000 }
   );
 
-  const data          = res.data?.data ?? res.data ?? {};
+  // Docs Pakasir: response ada di res.data.payment (bukan .data)
+  const data          = res.data?.payment ?? res.data?.data ?? res.data ?? {};
   const paymentNumber = data.payment_number ?? data.qris_number ?? data.qr_string ?? null;
   const expiredAt     = data.expired_at ?? data.expiry ?? null;
 
@@ -131,7 +131,7 @@ app.post('/transaction', requireInternal, async (req, res) => {
   }
 
   try {
-    const qris = await createQrisFromPakasir(order_id, amount, user_id);
+    const qris = await createQrisFromPakasir(order_id, amount);
 
     const expiredAt = qris.expiredAt ?? new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
