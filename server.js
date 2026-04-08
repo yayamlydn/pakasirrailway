@@ -124,9 +124,10 @@ app.get('/health', (_, res) => res.json({ status: 'ok' }));
  * Response: { ok, order_id, payment_number, pay_url, expired_at }
  */
 app.post('/transaction', requireInternal, async (req, res) => {
-  const { order_id, user_id, amount, bot_prefix } = req.body ?? {};
+  const { order_id, user_id, bot_prefix } = req.body ?? {};
+const amount = Number(req.body?.amount);
 
-  if (!order_id || !user_id || typeof amount !== 'number' || amount <= 0) {
+if (!order_id || !user_id || isNaN(amount) || amount <= 0) {
     return res.status(400).json({ error: 'order_id, user_id, dan amount (>0) wajib diisi.' });
   }
 
